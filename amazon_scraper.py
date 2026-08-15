@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 sys.path.insert(0, '.')
-from llm import ask_llm, llm_available
+from llm import ask_llm, ask_llm_json, llm_available
 from product_analytics import (parse_pack_size, price_per_ml,
                                star_distribution, review_timeline,
                                category_analytics, opportunity_cards)
@@ -811,7 +811,10 @@ These ARE the complaints even if the sample reviews above look positive. You MUS
 when this list is non-empty:
 {complaint_signals}
 
-Return ONLY this JSON (start with {{):
+Return ONLY this JSON (start with {{). FIELD ORDER MATTERS — the short/structured fields are
+written first and the two long free-text fields (key_positives, key_negatives) come LAST, so if
+you run low on room the scores, claims and aspects (needed to rank this product) are always
+complete even if a narrative field gets cut short:
 {{
 "brand": "clean brand name",
 "product_name": "<=70 chars",
@@ -835,21 +838,28 @@ Return ONLY this JSON (start with {{):
 "top_positives": [{{"point": "specific thing customers love", "mentions": <int>}}],
 "top_complaints": [{{"issue": "specific complaint", "mentions": <int>, "quote": "short verbatim"}}],
 "review_sentiment": "Positive/Mixed/Negative",
-"key_positives": "A DEEP, thorough 6-9 sentence analysis of what customers genuinely love. Name each specific strength, tie it to the aspect mention counts (e.g. 'Sun protection: praised in 1,223 of 1,300 mentions'), say which skin types/use-cases praise it and why (the mechanism), and quote a real review line where possible. Analytical, not a summary blurb.",
-"key_negatives": "A DEEP, hard-hitting 6-9 sentence analysis of the complaints and weaknesses. You MUST build this from the TOP COMPLAINT SIGNALS block — name each problem aspect AND its negative mention count (e.g. 'Skin compatibility drew 121 negative mentions: users with sensitive/acne-prone skin report breakouts and stinging'). Add any critical review quotes if present. Explain the likely CAUSE (why it happens), WHO it affects, and HOW SEVERE it is relative to total mentions. This section must NEVER be blank or vague when complaint signals exist — that is a failure.",
+"overall_score": <0-100>,
 "strategic_read": "3-5 sentences written FOR Deconstruct's product team: exactly where this competitor is STRONG (so we must match or clearly differentiate) and where they are WEAK (a specific gap we can attack). Make it actionable — what should Deconstruct DO about this product.",
 "market_gap": "2-3 sentences: the single biggest unmet need this product reveals = a specific launch/positioning opportunity for Deconstruct",
-"overall_score": <0-100>
+"key_positives": "A DEEP, thorough 6-9 sentence analysis of what customers genuinely love. Name each specific strength, tie it to the aspect mention counts (e.g. 'Sun protection: praised in 1,223 of 1,300 mentions'), say which skin types/use-cases praise it and why (the mechanism), and quote a real review line where possible. Analytical, not a summary blurb.",
+"key_negatives": "A DEEP, hard-hitting 6-9 sentence analysis of the complaints and weaknesses. You MUST build this from the TOP COMPLAINT SIGNALS block — name each problem aspect AND its negative mention count (e.g. 'Skin compatibility drew 121 negative mentions: users with sensitive/acne-prone skin report breakouts and stinging'). Add any critical review quotes if present. Explain the likely CAUSE (why it happens), WHO it affects, and HOW SEVERE it is relative to total mentions. This section must NEVER be blank or vague when complaint signals exist — that is a failure."
 }}
 Use null aspect scores where reviews give no signal. Prefer the Amazon aspect mention counts as ground truth. JSON only."""
 
-    result = ask_llm(prompt, system="Output valid JSON only. Start with {.",
-                     temperature=0.1, max_tokens=2200)
-    try:
-        return json.loads(result[result.index("{"): result.rindex("}") + 1])
-    except Exception as e:
-        print(f"[ai] parse error: {e}")
-        return _mock_analysis(product_data)
+    # key_positives/key_negatives ask for 6-9 dense sentences EACH, plus a full
+    # aspects dict, top_positives/top_complaints, claims — a big structured
+    # payload that a small model can cut off mid-field once it runs long.
+    # ask_llm_json retries uncached and salvages a truncated response instead
+    # of silently dropping to the mock (that was leaving "Reviews Deep-Dive"
+    # blank for real runs).
+    # Groq's free tier caps requests at 6000 tokens/minute (prompt + completion
+    # combined) — this prompt already runs a few thousand tokens with all the
+    # review/aspect context, so max_tokens stays modest to leave headroom
+    # rather than getting rejected outright (see llm.ask_llm_json / groq_chat
+    # for the retry-on-rate-limit backoff that also protects multi-product runs).
+    parsed = ask_llm_json(prompt, system="Output valid JSON only. Start with {.",
+                          temperature=0.2, max_tokens=2500, retries=2)
+    return parsed if parsed is not None else _mock_analysis(product_data)
 
 
 # ── scoring ───────────────────────────────────────────────────────────────────
@@ -1116,6 +1126,18 @@ def to_excel(results, keyword, strategy=None):
 
         wb = openpyxl.Workbook()
         analytics = category_analytics(results)
+        scanned_at = datetime.now().strftime("%d %B %Y, %H:%M")
+
+        def banner(ws, text, n_cols, height=100):
+            """Merged, wrapped explainer row pinned to the top of every tab:
+            what it shows, how the data was fetched, how far to trust it."""
+            last_col = get_column_letter(n_cols)
+            ws.merge_cells(f"A1:{last_col}1")
+            c = ws.cell(row=1, column=1, value=text)
+            c.fill = BLACK
+            c.font = Font(italic=True, size=10, color="C8F55A")
+            c.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
+            ws.row_dimensions[1].height = height
 
         # ══════════════════════════════════════════════════════════════════════
         # SHEET 1 — Ranked Products (ALL columns preserved + new ones added)
@@ -1123,6 +1145,15 @@ def to_excel(results, keyword, strategy=None):
         ws = wb.active
         assert ws is not None
         ws.title = "Ranked Products"
+        banner(ws,
+               f"WHAT THIS SHOWS — every tracked competitor product found for \"{keyword}\", ranked by a "
+               f"weighted 100-pt score (Rating 25% · Review volume 20% · Price value 20% · Claim strength 20% "
+               f"· Search rank 15%).  HOW IT'S FETCHED — scanned live from Amazon.in via SerpAPI on {scanned_at}; "
+               f"prices/ratings/review counts are Amazon's own live figures, claims and scores are AI-extracted "
+               f"(Groq) from that same scraped listing.  ACCURACY — hard numbers (price/rating/reviews/URL) are "
+               f"pulled directly from Amazon at scan time; claim/score fields are model interpretations of them "
+               f"— open the URL column to verify any figure before acting on it.",
+               26)
 
         headers = [
             "Final Rank", "Brand", "Product Name", "Date",
@@ -1134,10 +1165,10 @@ def to_excel(results, keyword, strategy=None):
             "Claim Strength\n(20%)", "Rank Score\n(15%)", "TOTAL SCORE",
             "Market Gap", "URL",
         ]
-        header_row(ws, headers)
+        header_row(ws, headers, row=2)
 
         for r in results:
-            row = r.get("final_rank", 1) + 1
+            row = r.get("final_rank", 1) + 2
             score = r.get("total_score", 0)
             row_fill = PatternFill("solid", fgColor="DCFCE7" if score >= 80 else
                                    "FEF9C3" if score >= 65 else
@@ -1186,16 +1217,25 @@ def to_excel(results, keyword, strategy=None):
                   40, 10, 12, 9, 9, 9, 9, 9, 11, 40, 30]
         for i, w in enumerate(widths, 1):
             ws.column_dimensions[get_column_letter(i)].width = w
-        ws.freeze_panes = "C2"
+        ws.freeze_panes = "C3"
 
         # ══════════════════════════════════════════════════════════════════════
         # SHEET 2 — Reviews Deep-Dive (long narrative + Amazon aspect counts)
         # ══════════════════════════════════════════════════════════════════════
         wr = wb.create_sheet("Reviews Deep-Dive")
+        banner(wr,
+               f"WHAT THIS SHOWS — a narrative read of what customers say about each product: what they love, "
+               f"what they complain about, and a strategic read for Deconstruct.  HOW IT'S FETCHED — built from "
+               f"Amazon's own \"Customers say\" aspect counts (drawn from its FULL review base, not a sample) "
+               f"plus a sampled set of the most-helpful positive and most-critical reviews scraped per product "
+               f"on {scanned_at}.  ACCURACY — the aspect mention counts (\"Top Amazon Aspects\" column) are "
+               f"Amazon's own authoritative figures; the LOVE/COMPLAIN/strategic-read prose is an AI (Groq) "
+               f"synthesis of that data — evidence-grounded, but read it as analysis, not a verbatim quote.",
+               7)
         header_row(wr, ["Brand", "Product", "Rating", "What Customers LOVE",
                         "What Customers COMPLAIN About", "Strategic Read (for Deconstruct)",
-                        "Top Amazon Aspects (mentions)"])
-        for row_i, r in enumerate(results, 2):
+                        "Top Amazon Aspects (mentions)"], row=2)
+        for row_i, r in enumerate(results, 3):
             asp = r.get("amazon_aspects", []) or []
             asp_txt = "\n".join(
                 f"{a.get('aspect','')}: {a.get('positive',0)}/{a.get('total',0)}+ "
@@ -1216,14 +1256,23 @@ def to_excel(results, keyword, strategy=None):
             wr.row_dimensions[row_i].height = 150
         for i, w in enumerate([16, 30, 8, 60, 60, 55, 34], 1):
             wr.column_dimensions[get_column_letter(i)].width = w
-        wr.freeze_panes = "A2"
+        wr.freeze_panes = "A3"
 
         # ══════════════════════════════════════════════════════════════════════
         # SHEET 3 — Pricing & Demand
         # ══════════════════════════════════════════════════════════════════════
         wp = wb.create_sheet("Pricing & Demand")
+        banner(wp,
+               f"WHAT THIS SHOWS — category-wide selling-price and ₹/ml distribution, plus a demand proxy "
+               f"(Amazon's own \"bought in past month\" badge) across every tracked competitor.  HOW IT'S "
+               f"FETCHED — live selling prices scraped from each product page on {scanned_at}; ₹/ml is "
+               f"calculated from the scraped pack size (price ÷ size).  ACCURACY — prices are Amazon's live "
+               f"figures at scan time (they move daily); \"Bought/Month\" is Amazon's own rounded badge "
+               f"(e.g. \"1K+ bought\") shown only where Amazon displays it — read it as a directional demand "
+               f"signal, not an exact unit count.",
+               4)
         ps, pm = analytics.get("price_stats", {}), analytics.get("per_ml_stats", {})
-        wp.cell(row=1, column=1, value="Category Pricing").font = Font(bold=True, size=13)
+        wp.cell(row=2, column=1, value="Category Pricing").font = Font(bold=True, size=13)
         rows = [
             ("Metric", "Selling Price (₹)", "₹ / ml"),
             ("Lowest", ps.get("min", "—"), pm.get("min", "—")),
@@ -1232,17 +1281,17 @@ def to_excel(results, keyword, strategy=None):
             ("Q3 (75th pct)", ps.get("q3", "—"), pm.get("q3", "—")),
             ("Highest", ps.get("max", "—"), pm.get("max", "—")),
         ]
-        for ri, rowv in enumerate(rows, 3):
+        for ri, rowv in enumerate(rows, 4):
             for ci, v in enumerate(rowv, 1):
                 c = wp.cell(row=ri, column=ci, value=v)
                 c.border = thin
-                if ri == 3:
+                if ri == 4:
                     c.fill = BLACK
                     c.font = LIME_FONT
-        wp.cell(row=11, column=1,
+        wp.cell(row=12, column=1,
                 value="Demand — Bought in past month (proxy for sales velocity)").font = Font(bold=True, size=13)
-        header_row(wp, ["Brand", "Product", "Bought/Month", "Selling Price (₹)"], row=12)
-        for ri, d in enumerate(analytics.get("demand", []), 13):
+        header_row(wp, ["Brand", "Product", "Bought/Month", "Selling Price (₹)"], row=13)
+        for ri, d in enumerate(analytics.get("demand", []), 14):
             for ci, v in enumerate([d["brand"], str(d["product"])[:50], d["bought"],
                                     f"₹{int(d['price'])}" if d.get("price") else "—"], 1):
                 c = wp.cell(row=ri, column=ci, value=v)
@@ -1255,9 +1304,17 @@ def to_excel(results, keyword, strategy=None):
         # SHEET 4 — Opportunities (whitespace, pain points, claim/ingredient freq)
         # ══════════════════════════════════════════════════════════════════════
         wo = wb.create_sheet("Opportunities")
-        wo.cell(row=1, column=1,
+        banner(wo,
+               f"WHAT THIS SHOWS — launch/positioning whitespace: category pain points (aspects with the most "
+               f"negative review mentions) and the most crowded claims across tracked competitors.  HOW IT'S "
+               f"FETCHED — aggregated from the same scraped listings and Amazon aspect counts as the other "
+               f"tabs, scanned {scanned_at}.  ACCURACY — these are AI-surfaced patterns over real scraped data; "
+               f"treat each card as a starting hypothesis for the product team, not a guarantee — verify a "
+               f"specific gap before committing R&D against it.",
+               4)
+        wo.cell(row=2, column=1,
                 value="Launch & Positioning Opportunities").font = Font(bold=True, size=14, color="0A0A0A")
-        r_ = 3
+        r_ = 4
         for card in opportunity_cards(analytics):
             wo.cell(row=r_, column=1, value=f"[{card['type']}] {card['title']}").font = Font(bold=True, size=11)
             wo.cell(row=r_ + 1, column=1, value=card["detail"]).alignment = WRAP
@@ -1284,11 +1341,17 @@ def to_excel(results, keyword, strategy=None):
         # SHEET 5 — Executive Summary
         # ══════════════════════════════════════════════════════════════════════
         we = wb.create_sheet("Executive Summary", 0)  # first tab
-        we.cell(row=1, column=1,
+        banner(we,
+               f"WHAT THIS SHOWS — a one-page roll-up of this whole run: headline numbers only.  HOW IT'S "
+               f"FETCHED — aggregated from the \"Ranked Products\" tab, itself a live Amazon.in scan taken on "
+               f"{scanned_at}.  ACCURACY — summary stats only; open \"Ranked Products\" for the per-product "
+               f"data behind every figure here, and the URL there to verify any single listing.",
+               2)
+        we.cell(row=2, column=1,
                 value="Decon AI — Competitor Marketplace Analysis").font = Font(bold=True, size=15)
         summary = [
             ("Keyword", keyword),
-            ("Date", datetime.now().strftime("%d %B %Y")),
+            ("Scanned at", scanned_at),
             ("Products analysed", analytics.get("n", len(results))),
             ("Avg rating", analytics.get("ratings_avg", "—")),
             ("Price range (₹)", f"₹{ps.get('min','?')} – ₹{ps.get('max','?')} (median ₹{ps.get('median','?')})" if ps else "—"),
@@ -1299,7 +1362,7 @@ def to_excel(results, keyword, strategy=None):
                                     + f" ({analytics.get('pain_points',[{}])[0].get('negative',0)} complaints)") if analytics.get("pain_points") else "—"),
             ("Deconstruct in set?", "Yes — baseline" if analytics.get("baseline_present") else "No"),
         ]
-        for ri, (k, v) in enumerate(summary, 3):
+        for ri, (k, v) in enumerate(summary, 4):
             we.cell(row=ri, column=1, value=k).font = Font(bold=True)
             we.cell(row=ri, column=2, value=v).alignment = WRAP
         we.column_dimensions["A"].width = 26
@@ -1315,10 +1378,17 @@ def to_excel(results, keyword, strategy=None):
 
         def _brief_sheet(title, rows):
             sh = wb.create_sheet(title)
-            sh.cell(row=1, column=1, value=f"Decon AI — {title} (AI synthesis, grounded in the "
-                    "scraped facts & Amazon's counted review aspects)").font = Font(bold=True, size=12)
-            sh.merge_cells("A1:B1")
-            for ri, (label, val) in enumerate(rows, 3):
+            banner(sh,
+                   f"WHAT THIS SHOWS — the \"{title}\" brief.  HOW IT'S FETCHED — an AI (Groq) "
+                   f"synthesis written FROM the scraped listings, live prices and Amazon's counted review "
+                   f"aspects on the \"Ranked Products\" / \"Reviews Deep-Dive\" tabs, scanned {scanned_at} — "
+                   f"it adds no outside data.  ACCURACY — this is interpretation and strategic judgement built "
+                   f"on real scraped facts, not a raw data export; treat it as an analyst's read to sense-check, "
+                   f"not a verbatim source.",
+                   2)
+            sh.cell(row=2, column=1, value=f"Decon AI — {title}").font = Font(bold=True, size=12)
+            sh.merge_cells("A2:B2")
+            for ri, (label, val) in enumerate(rows, 4):
                 c1 = sh.cell(row=ri, column=1, value=label)
                 c1.font = Font(bold=True, color="0A0A0A")
                 c1.alignment = Alignment(vertical="top", wrap_text=True)

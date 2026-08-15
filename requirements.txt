@@ -20,19 +20,5 @@ plotly==6.8.0
 openpyxl==3.1.5
 pillow==12.2.0
 
-# ── document ingestion (HR / GSC) ──
-pdfplumber==0.11.10
-python-docx==1.2.0
-
-# ── Google Search Console live API ──
-google-api-python-client==2.198.0
-google-auth==2.55.1
-google-auth-oauthlib==1.4.0
-
-# ── Comp's Nemesis: Postgres store (Supabase/Neon) ──
-psycopg[binary]==3.3.4
-
-# ── optional/lazy data sources (kept for full local↔hosted parity;
-#    each is imported lazily and gated, so they never run unless invoked) ──
-pytrends==4.9.2
+# ── deep review sampling (Product Intelligence / Review Intelligence) ──
 apify-client==3.0.3

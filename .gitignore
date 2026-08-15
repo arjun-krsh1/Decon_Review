@@ -1,6 +1,7 @@
 # ── secrets — NEVER commit these ──
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 # Google service-account keys (incl. the one shared earlier — rotate it!)

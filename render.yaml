@@ -21,15 +21,6 @@ services:
         sync: false
       - key: SERPAPI_KEY
         sync: false
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: MAGNIFIC_API_KEY
-        sync: false
-      # Makes Nykaa/Myntra/Flipkart scraping work from Render's datacenter IP:
-      - key: SCRAPER_API_KEY
-        sync: false
-      # Optional (only if you use these paths):
+      # Optional — enables the deep (~100+) review sample instead of the free sample:
       - key: APIFY_KEY
-        sync: false
-      - key: GSC_SA_JSON
         sync: false

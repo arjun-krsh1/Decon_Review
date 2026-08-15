@@ -19,6 +19,7 @@ LLM regardless of LLM_PROVIDER — e.g. the GEO agent's extractor.
 
 import os
 import json
+import re
 import time
 import hashlib
 import pathlib
@@ -108,6 +109,97 @@ def ask_llm(prompt: str, system: str = "You are a concise analyst.",
     return text
 
 
+def _extract_json(text):
+    """Parse the {...} JSON object out of a raw LLM response, repairing the one
+    invalid-escape quirk Groq models produce: an apostrophe inside a quoted
+    string sometimes comes out as \\' , which is not a legal JSON escape
+    (only \\" \\\\ \\/ \\b \\f \\n \\r \\t \\uXXXX are)."""
+    sub = text[text.index("{"): text.rindex("}") + 1]
+    try:
+        return json.loads(sub)
+    except json.JSONDecodeError:
+        return json.loads(re.sub(r"\\'", "'", sub))
+
+
+def _salvage_json(text):
+    """Last resort for a response cut off mid-JSON (the model hit the token cap
+    while writing a long field, sometimes mid-string). Walk the text once,
+    recording every comma that falls outside a string together with the
+    bracket-nesting stack at that point, then try closing the JSON at each of
+    those safe commas — most-content-first — until one parses. This drops only
+    the dangling unfinished tail instead of throwing the whole response away."""
+    sub = re.sub(r"\\'", "'", text[text.index("{"):])
+    stack = []
+    safe_cuts = []  # (index_after_comma, stack_snapshot)
+    in_str, escape = False, False
+    for i, ch in enumerate(sub):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+        elif ch == "," and stack:
+            safe_cuts.append((i, tuple(stack)))
+
+    for idx, snapshot in reversed(safe_cuts):
+        candidate = sub[:idx] + "".join(reversed(snapshot))
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("no salvageable JSON prefix found")
+
+
+def ask_llm_json(prompt: str, system: str = "Output valid JSON only. Start with {.",
+                  temperature: float = 0.3, max_tokens: int = 6500, retries: int = 2):
+    """ask_llm(), but for prompts that must return a JSON object.
+
+    Long structured completions (many free-text fields, quoted review
+    snippets) are the case most likely to trip up a small model: either an
+    illegal \\' escape, or the response getting cut off mid-field once it
+    runs long. This wraps ask_llm with that failure mode in mind:
+      1. cached attempt (ask_llm) — instant on repeat calls with the same prompt
+      2. `retries` fresh, UNCACHED attempts (groq_chat) if parsing still fails
+      3. salvage whatever fully-formed part of the LAST attempt is left, so a
+         truncated response still returns real (partial) data
+    Returns None (never raises) if every attempt and the salvage both fail —
+    callers should fall back to their own mock/template in that case.
+    """
+    attempts = [lambda: ask_llm(prompt, system=system, temperature=temperature, max_tokens=max_tokens)]
+    attempts += [lambda: groq_chat(prompt, system=system, temperature=max(temperature - 0.1, 0.1),
+                                    max_tokens=max_tokens) for _ in range(retries)]
+
+    last_result = ""
+    for i, call in enumerate(attempts):
+        result = call()
+        if not result:
+            continue
+        last_result = result
+        try:
+            return _extract_json(result)
+        except Exception as e:
+            print(f"[llm] ask_llm_json parse error (attempt {i + 1}): {e}")
+
+    if last_result:
+        try:
+            print("[llm] ask_llm_json salvaging partial JSON from the last attempt")
+            return _salvage_json(last_result)
+        except Exception as e:
+            print(f"[llm] ask_llm_json salvage failed: {e}")
+
+    return None
+
+
 def groq_available() -> bool:
     """True if a Groq key is configured (independent of the active PROVIDER)."""
     return bool(GROQ_API_KEY)
@@ -145,9 +237,13 @@ def groq_chat(prompt: str, system: str = "You are a precise analyst.",
                 json=payload,
                 timeout=45,
             )
-            if r.status_code == 429:
+            # Groq's free tier caps requests-per-minute (429) AND tokens-per-minute
+            # (returned as 413 "rate_limit_exceeded", not 429 — easy to miss).
+            # Both recover once the per-minute window rolls over, so both get
+            # the same backoff-and-retry instead of failing the caller outright.
+            if r.status_code == 429 or (r.status_code == 413 and "rate_limit" in r.text):
                 wait = min(float(r.headers.get("retry-after", backoff)), 20.0)
-                print(f"[llm] groq rate-limited (429) — waiting {wait:.0f}s "
+                print(f"[llm] groq rate-limited ({r.status_code}) — waiting {wait:.0f}s "
                       f"(attempt {attempt + 1}/{max_retries})")
                 time.sleep(wait)
                 backoff *= 2
